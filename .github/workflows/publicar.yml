@@ -75,6 +75,36 @@ env:
   FUENTE: soydanil/harness-app
   RAMA: main
 
+  # ─── La identidad de la app, copiada aquí a propósito ───────────────────────
+  #
+  # Estas tres cosas **no se pueden cambiar publicando**. Un cambio en cualquiera
+  # de ellas sale de un build que funciona, de un instalador que se ejecuta y de
+  # una corrida en verde — y rompe algo que nadie va a ver hasta semanas después:
+  #
+  #   • `LLAVE_PUBLICA` — la app instalada verifica lo que baja contra la llave
+  #     que lleva **compilada dentro de su propio binario**. Una release firmada
+  #     con otra llave no es «una actualización que falla»: esa copia queda
+  #     varada en su versión para siempre, y desde dentro no hay vuelta. Rotar la
+  #     llave son dos pasos y en este orden: primero una versión firmada con la
+  #     llave VIEJA que ya lleve la NUEVA dentro, y solo después firmar con la
+  #     nueva. Quien se salte esa versión puente reinstala a mano.
+  #
+  #   • `IDENTIFICADOR` — es dónde viven los datos (sesiones, cuentas, consumo) y
+  #     la llave del llavero. Cambiarlo no borra nada: deja los datos huérfanos y
+  #     la app abre **vacía**, sin error y sin aviso.
+  #
+  #   • `NOMBRE` — es la clave del registro de desinstalación en Windows
+  #     (`HKCU\…\Uninstall\Terminus`) y la carpeta de instalación. Cambiarlo
+  #     instala **al lado** de la copia vieja: dos entradas en Programas y
+  #     características y dos apps en disco.
+  #
+  # Duplicarlas aquí es el punto: son la memoria de lo que las copias instaladas
+  # ya creen. Cambiarlas exige tocar este archivo, que es un PR que alguien lee —
+  # en vez de un `tauri.conf.json` que se edita por otra razón.
+  LLAVE_PUBLICA: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM5ODEzRDE1M0QwQ0RFQjgKUldTNDNndzlGVDJCT1hPSnp4ZzBIbkowOW9kVGFYb0YyRkZKZjNTT2N3eERXOXhuRi9UblY5d3EK
+  IDENTIFICADOR: ai.danil.harness
+  NOMBRE: Terminus
+
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   # ¿Hay algo que publicar? Sale barato preguntarlo, y ahorra los dos runners.
@@ -94,6 +124,62 @@ jobs:
           ref: ${{ env.RAMA }}
           ssh-key: ${{ secrets.HARNESS_DEPLOY_KEY }}
           fetch-depth: 1
+
+      # El código del instalador `npx` vive en este repo y lleva **una tercera
+      # copia** de la llave pública: la usa para verificar lo que baja antes de
+      # ejecutarlo. Si se queda con la vieja, `npx` deja de instalar el día de
+      # una rotación aunque la app se actualice bien.
+      - name: Traer el instalador npx
+        uses: actions/checkout@v4
+        with:
+          path: canal
+          fetch-depth: 1
+
+      # Lo que este paso protege no lo protege ninguna otra cosa: el build, el
+      # instalador y la corrida salen todos en verde con la identidad cambiada.
+      # Falla aquí, antes de publicar, porque después de publicar ya no se puede
+      # arreglar en las copias instaladas.
+      - name: La identidad no cambió a espaldas de nadie
+        run: |
+          set -euo pipefail
+
+          mal=0
+          comparar() {
+            local que="$1" esperado="$2" encontrado="$3" consecuencia="$4"
+            if [ "$esperado" != "$encontrado" ]; then
+              echo "::error title=$que cambió::esperado '$esperado', encontrado '$encontrado'. $consecuencia"
+              mal=1
+            fi
+          }
+
+          comparar "La llave pública del updater" \
+            "$LLAVE_PUBLICA" \
+            "$(jq -r .plugins.updater.pubkey src-tauri/tauri.conf.json)" \
+            "Publicar así deja varada en su versión, para siempre, a toda copia ya instalada. Se rota en dos pasos: primero una versión firmada con la llave vieja que lleve la nueva dentro."
+
+          comparar "El identificador del bundle" \
+            "$IDENTIFICADOR" \
+            "$(jq -r .identifier src-tauri/tauri.conf.json)" \
+            "Los datos de quien ya la tiene quedan huérfanos y la app abre vacía, sin error. Hace falta una migración en migration.rs."
+
+          comparar "El nombre del producto" \
+            "$NOMBRE" \
+            "$(jq -r .productName src-tauri/tauri.conf.json)" \
+            "La actualización instala al lado de la copia vieja: dos entradas en Programas y características."
+
+          comparar "La llave pública que usa npx" \
+            "$LLAVE_PUBLICA" \
+            "$(sed -n "s/^ *'\(dW50cnVzdGVk[^']*\)';$/\1/p" canal/npx/bin.mjs | head -1)" \
+            "npx dejaría de poder instalar aunque la app se actualice bien."
+
+          [ "$mal" = 0 ] || {
+            echo ""
+            echo "Si el cambio es deliberado, va en el mismo PR que actualiza estos valores"
+            echo "en .github/workflows/publicar.yml — y lee ahí lo que cuesta cada uno."
+            exit 1
+          }
+
+          echo "Identidad intacta: misma llave, mismo identificador, mismo nombre."
 
       - name: Comparar con lo publicado
         id: comparar
