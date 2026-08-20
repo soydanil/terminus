@@ -1,0 +1,376 @@
+# Mira si `soydanil/harness-app` tiene una versión que aquí no está, y si la
+# tiene la construye para macOS y Windows y la publica como release.
+#
+# **Por qué vive aquí y no en el repo del código.** Ahí vivía —`desktop-build.yml`—
+# y se retiró el 12-ago (`6c83bfd`): `harness-app` es privado y los minutos del
+# plan Free se facturan Windows ×2 y macOS ×10, así que construir instaladores los
+# agotó en dos días. Y agotarse no se ve como se cree: los jobs **fallan sin
+# ejecutar un solo paso** —tres segundos, cero pasos— y en pantalla eso es idéntico
+# a código roto. Se mergearon PRs con checks en rojo que no significaban nada.
+#
+# Este repo es **público**, y en los repos públicos las Actions no gastan minutos
+# —tampoco los de macOS—. La causa por la que aquello se retiró no existe aquí.
+#
+# **Qué se publica y qué no.** El código sigue siendo privado: la única copia que
+# toca este workflow vive en el disco efímero del runner y muere con él. Aquí solo
+# aterrizan los binarios y su `latest.json`.
+#
+# ## El contrato con las dos cosas que consumen esto
+#
+#   • **La app instalada** pregunta por
+#     `releases/latest/download/latest.json` (`tauri.conf.json` → `plugins.updater`)
+#     y enseña el aviso de versión nueva abajo a la derecha. `releases/latest`
+#     resuelve a la última release **publicada** —ni borrador ni prerelease—, así
+#     que aquí no se crea ninguna de las dos.
+#
+#   • **terminus.danil.ai** enlaza a `releases/latest/download/Terminus-Windows-Setup.exe`
+#     y `.../Terminus-macOS.dmg`. Son **nombres estables sin versión dentro**: la
+#     página no se toca al publicar, y por eso este workflow sube una copia con
+#     ese nombre además del archivo versionado. Cambiarlos rompe el botón de
+#     descarga sin que nada avise.
+#
+# ## Firmar no es opcional, y no es la firma del sistema
+#
+# La app comprueba lo que se baja contra la llave pública **que viaja dentro del
+# binario ya instalado**. Una release sin firmar no se instala mal: no se instala,
+# y la copia de quien la esperaba se queda donde está. Es minisign, y no tiene
+# nada que ver con Authenticode ni con la notarización de Apple —esas siguen sin
+# existir, y lo que producen es el aviso de SmartScreen la primera vez—.
+name: publicar
+
+on:
+  # Cada media hora, que es lo que convierte «hay que acordarse» en «ya está».
+  # Lo que mira es barato: un checkout superficial y leer un JSON. Si la versión
+  # de `main` ya tiene release, no arranca ningún runner de build.
+  #
+  # **Aviso que se paga solo una vez si se sabe:** GitHub apaga los `schedule` de
+  # un repo sin actividad en 60 días. Publicar crea un tag, y un tag es
+  # actividad — mientras se publique, esto sigue vivo. Si el producto se congela
+  # medio año, lo primero que hay que mirar al volver es si el cron sigue
+  # encendido.
+  schedule:
+    - cron: "*/30 * * * *"
+
+  # Y a mano, para no esperar la media hora después de mergear a `main`:
+  #
+  #     gh workflow run publicar.yml -R soydanil/terminus
+  #
+  # (o `pnpm publicar` desde `harness-app`, que hace exactamente eso).
+  workflow_dispatch:
+    inputs:
+      rehacer:
+        description: "Volver a construir aunque la versión ya tenga release (la reemplaza)"
+        type: boolean
+        default: false
+
+# Dos corridas a la vez se pisarían creando el mismo tag. No se cancela la que
+# esté en curso: a mitad de un build cancelar deja el tag sin sus binarios.
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+env:
+  # De dónde sale el código. Privado: se entra con la deploy key de solo lectura
+  # `HARNESS_DEPLOY_KEY`, que solo sirve para leer ese repo y para nada más.
+  FUENTE: soydanil/harness-app
+  RAMA: main
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # ¿Hay algo que publicar? Sale barato preguntarlo, y ahorra los dos runners.
+  # ─────────────────────────────────────────────────────────────────────────────
+  mirar:
+    runs-on: ubuntu-latest
+    outputs:
+      hay: ${{ steps.comparar.outputs.hay }}
+      version: ${{ steps.comparar.outputs.version }}
+      sha: ${{ steps.comparar.outputs.sha }}
+      nota: ${{ steps.comparar.outputs.nota }}
+    steps:
+      - name: Traer la fuente
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FUENTE }}
+          ref: ${{ env.RAMA }}
+          ssh-key: ${{ secrets.HARNESS_DEPLOY_KEY }}
+          fetch-depth: 1
+
+      - name: Comparar con lo publicado
+        id: comparar
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REHACER: ${{ inputs.rehacer }}
+        run: |
+          set -euo pipefail
+
+          # La versión de la app la manda `tauri.conf.json`: es la que se compila
+          # dentro del binario y la que el updater compara. `package.json` y
+          # `Cargo.toml` la repiten y podrían desincronizarse, así que se
+          # comprueba que las tres digan lo mismo antes de publicar nada — una
+          # release cuyo binario dice otra versión que su `latest.json` deja a
+          # todo el mundo en bucle de actualizar.
+          V=$(jq -r .version src-tauri/tauri.conf.json)
+          VP=$(jq -r .version package.json)
+          VC=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$V" != "$VP" ] || [ "$V" != "$VC" ]; then
+            echo "::error::Las versiones no coinciden — tauri.conf.json=$V package.json=$VP Cargo.toml=$VC"
+            exit 1
+          fi
+
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+          # La nota es lo que lee una persona en la página de la release. Sale
+          # del repo del código para que se revise en el mismo PR que sube la
+          # versión, y no se invente aquí.
+          {
+            echo "nota<<FIN"
+            if [ -f NOTA-DE-VERSION.md ]; then cat NOTA-DE-VERSION.md; else echo "Mejoras y correcciones."; fi
+            echo "FIN"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${REHACER:-false}" = "true" ]; then
+            echo "Se pidió rehacer v$V."
+            echo "hay=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "v$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$V ya está publicada. No hay nada que hacer."
+            echo "hay=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$V no está publicada. Se construye."
+            echo "hay=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Un runner por plataforma. Cross-compilar Windows desde macOS no funciona —el
+  # target MSVC necesita el `link.exe` de Microsoft— así que no hay atajo.
+  # ─────────────────────────────────────────────────────────────────────────────
+  construir:
+    needs: mirar
+    if: needs.mirar.outputs.hay == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - so: windows-latest
+            nombre: windows
+          # `macos-latest` es Apple Silicon. **Solo arm64, y a propósito:**
+          # `git:fetch` empaqueta el git del host que compila, así que un binario
+          # universal llevaría dentro un git de una sola arquitectura y en el otro
+          # Mac no arrancaría — roto en silencio, que es peor que no estar. Un Mac
+          # Intel cae al git del sistema, camino que `env.rs` ya cubre.
+          - so: macos-latest
+            nombre: macos
+    runs-on: ${{ matrix.so }}
+    steps:
+      - name: Traer la fuente
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FUENTE }}
+          ref: ${{ env.RAMA }}
+          ssh-key: ${{ secrets.HARNESS_DEPLOY_KEY }}
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.nombre }}
+
+      - run: pnpm install --frozen-lockfile
+
+      # El git que viaja dentro del instalador: MinGit en Windows, el árbol de
+      # Homebrew con las dylibs relocalizadas en macOS. Sin este paso el bundle
+      # sale sin git y la app depende de que la máquina destino lo tenga.
+      - name: Preparar el git empaquetado
+        run: pnpm git:fetch
+
+      - name: Construir y firmar
+        env:
+          # Sin estas dos la build sale sin `.sig` y `createUpdaterArtifacts` no
+          # se queja: produce el instalador igual. El fallo aparecería meses
+          # después, en la máquina de alguien que no puede actualizar.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm desktop:build
+
+      # Los nombres que produce Tauri llevan la versión y la arquitectura dentro,
+      # y cambian solos al subir cualquiera de las dos. Aquí se normalizan a una
+      # carpeta con nombres fijos: lo que el paso de publicar espera encontrar
+      # deja de depender de cómo se llamó el archivo hoy.
+      #
+      # Y **se falla si algo no está**. Un `cp` que no encuentra su origen en un
+      # `if` amable publica una release a la que le falta el `.sig`, que es
+      # exactamente la release que nadie puede instalar.
+      - name: Recoger los artefactos
+        shell: bash
+        env:
+          V: ${{ needs.mirar.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p entrega
+          B=src-tauri/target/release/bundle
+
+          exigir() {
+            local que="$1" destino="$2"
+            local f
+            f=$(find "$B" -type f -name "$que" | head -1)
+            if [ -z "$f" ]; then
+              echo "::error::No se construyó ningún $que. Contenido de $B:"
+              find "$B" -type f | sed 's/^/    /'
+              exit 1
+            fi
+            cp "$f" "entrega/$destino"
+            echo "  $que → $destino  ($(du -h "$f" | cut -f1))"
+          }
+
+          if [ "${{ matrix.nombre }}" = "windows" ]; then
+            # NSIS y no MSI: es el formato que el updater sabe aplicar sin
+            # intervención, y `installMode: passive` lo instala enseñando barra
+            # de progreso pero sin preguntar nada.
+            exigir '*_x64-setup.exe'     "Terminus_${V}_x64-setup.exe"
+            exigir '*_x64-setup.exe.sig' "Terminus_${V}_x64-setup.exe.sig"
+            cp "entrega/Terminus_${V}_x64-setup.exe" entrega/Terminus-Windows-Setup.exe
+          else
+            # En macOS el updater NO usa el DMG: reemplaza el `.app` desde un
+            # tar.gz. El DMG es solo para la primera instalación desde la página,
+            # y hasta hoy no se construía — el botón de macOS de terminus.danil.ai
+            # daba 404.
+            exigir '*.app.tar.gz'     "Terminus_${V}_aarch64.app.tar.gz"
+            exigir '*.app.tar.gz.sig' "Terminus_${V}_aarch64.app.tar.gz.sig"
+            exigir '*.dmg'            "Terminus_${V}_aarch64.dmg"
+            cp "entrega/Terminus_${V}_aarch64.dmg" entrega/Terminus-macOS.dmg
+          fi
+
+          echo "### Instaladores — ${{ matrix.nombre }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "git empaquetado: \`$(tr -d '\n' < src-tauri/resources/git-version.txt)\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| archivo | tamaño |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for f in entrega/*; do
+            echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: entrega-${{ matrix.nombre }}
+          if-no-files-found: error
+          path: entrega/*
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Una sola release con las dos plataformas dentro, y el `latest.json` que la
+  # app consulta. Va en un job aparte porque **publicar media release es peor que
+  # no publicarla**: si macOS falla, aquí no se llega y Windows tampoco sale.
+  # ─────────────────────────────────────────────────────────────────────────────
+  publicar:
+    needs: [mirar, construir]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: entrega
+          merge-multiple: true
+
+      - name: Armar latest.json
+        env:
+          V: ${{ needs.mirar.outputs.version }}
+          NOTA: ${{ needs.mirar.outputs.nota }}
+        run: |
+          set -euo pipefail
+          ls -la entrega
+
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/v$V"
+
+          # Las claves de plataforma las decide el plugin, no nosotros: la app
+          # busca **la suya** y, si no está, concluye que está al día. Sin ruido,
+          # sin error y sin actualizarse nunca — que es como estuvo `darwin` desde
+          # la primera release hasta hoy.
+          jq -n \
+            --arg v "$V" \
+            --arg notas "$NOTA" \
+            --arg fecha "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+            --arg win_sig "$(cat "entrega/Terminus_${V}_x64-setup.exe.sig")" \
+            --arg win_url "$BASE/Terminus_${V}_x64-setup.exe" \
+            --arg mac_sig "$(cat "entrega/Terminus_${V}_aarch64.app.tar.gz.sig")" \
+            --arg mac_url "$BASE/Terminus_${V}_aarch64.app.tar.gz" \
+            '{
+              version: $v,
+              notes: $notas,
+              pub_date: $fecha,
+              platforms: {
+                "windows-x86_64": { signature: $win_sig, url: $win_url },
+                "darwin-aarch64": { signature: $mac_sig, url: $mac_url }
+              }
+            }' > entrega/latest.json
+
+          cat entrega/latest.json
+
+      - name: Publicar la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.mirar.outputs.version }}
+          NOTA: ${{ needs.mirar.outputs.nota }}
+          SHA: ${{ needs.mirar.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          CUERPO=$(printf '%s\n\n---\n\nWindows: `Terminus-Windows-Setup.exe` · macOS (Apple Silicon): `Terminus-macOS.dmg`\n\nQuien ya la tenga instalada no necesita bajar nada: la app avisa sola.\n\nConstruida desde `%s` en `%s`.\n' "$NOTA" "$SHA" "$GITHUB_RUN_ID")
+
+          # Rehacer una versión reemplaza la release entera. Borrarla y crearla de
+          # nuevo, y no `upload --clobber`, porque un asset que dejó de producirse
+          # se quedaría colgando de la anterior y el `latest.json` nuevo no lo
+          # menciona: un archivo que nadie referencia pero que la página sí
+          # enlaza por nombre estable.
+          if gh release view "v$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Reemplazando v$V."
+            gh release delete "v$V" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+
+          gh release create "v$V" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "v$V" \
+            --notes "$CUERPO" \
+            --latest \
+            entrega/*
+
+      # Comprobar lo publicado desde fuera, por la misma URL que usan la app y la
+      # página. Que el paso anterior salga con 0 dice que GitHub aceptó los
+      # archivos; no dice que `releases/latest` resuelva a esta release ni que el
+      # `latest.json` que se sirve sea este. Es lo único que lo convierte en un
+      # hecho, y cuesta tres segundos.
+      - name: Comprobar que la app lo ve
+        env:
+          V: ${{ needs.mirar.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/latest/download"
+
+          J=$(curl -fsSL "$BASE/latest.json")
+          echo "$J" | jq .
+
+          [ "$(echo "$J" | jq -r .version)" = "$V" ] \
+            || { echo "::error::releases/latest sirve otra versión"; exit 1; }
+          for p in windows-x86_64 darwin-aarch64; do
+            echo "$J" | jq -e --arg p "$p" '.platforms[$p].signature | length > 0' >/dev/null \
+              || { echo "::error::$p se publicó sin firma"; exit 1; }
+          done
+
+          # Y que los dos nombres estables que enlaza terminus.danil.ai existan.
+          for a in Terminus-Windows-Setup.exe Terminus-macOS.dmg; do
+            curl -fsSIL -o /dev/null "$BASE/$a" \
+              || { echo "::error::$a no se puede descargar — el botón de la página está roto"; exit 1; }
+          done
+
+          echo "v$V publicada, firmada para las dos plataformas y descargable."
