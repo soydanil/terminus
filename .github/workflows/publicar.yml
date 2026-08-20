@@ -331,8 +331,20 @@ jobs:
             # tar.gz. El DMG es solo para la primera instalación desde la página,
             # y hasta hoy no se construía — el botón de macOS de terminus.danil.ai
             # daba 404.
-            exigir '*.app.tar.gz'     "Terminus_${V}_aarch64.app.tar.gz"
-            exigir '*.app.tar.gz.sig' "Terminus_${V}_aarch64.app.tar.gz.sig"
+            # **Este no se renombra, y es la excepción que hay que respetar.**
+            # La firma minisign sella también el NOMBRE del archivo firmado, en
+            # su comentario de confianza. Tauri lo llama `Terminus.app.tar.gz`;
+            # publicarlo como `Terminus_0.1.8_aarch64.app.tar.gz` deja la firma
+            # hablando de un archivo que ya no existe, y quien comprueba ese
+            # dato —`npx`, que lo hace a propósito— se niega a instalar:
+            #
+            #   la firma es para "Terminus.app.tar.gz",
+            #   no para "Terminus_0.1.8_aarch64.app.tar.gz"
+            #
+            # En Windows no se ve porque ahí el nombre que pone Tauri ya trae la
+            # versión y el renombrado era el mismo nombre. Aquí no.
+            exigir '*.app.tar.gz'     "Terminus.app.tar.gz"
+            exigir '*.app.tar.gz.sig' "Terminus.app.tar.gz.sig"
             exigir '*.dmg'            "Terminus_${V}_aarch64.dmg"
             cp "entrega/Terminus_${V}_aarch64.dmg" entrega/Terminus-macOS.dmg
           fi
@@ -369,6 +381,29 @@ jobs:
           path: entrega
           merge-multiple: true
 
+      # La firma no cubre solo los bytes: su comentario de confianza lleva el
+      # **nombre** del archivo que se firmó. Publicarlo con otro nombre deja una
+      # release que se instala en unos sitios y no en otros —el updater de Tauri
+      # mira los bytes, `npx` mira además el nombre y se niega— y eso no se ve
+      # aquí: se ve en la terminal de otro, tres canales más allá.
+      #
+      # Pasó con `Terminus.app.tar.gz`, renombrado a `Terminus_0.1.8_aarch64…`.
+      - name: Cada firma habla del archivo que se publica
+        run: |
+          set -euo pipefail
+          mal=0
+          for sig in entrega/*.sig; do
+            archivo=$(basename "${sig%.sig}")
+            dentro=$(base64 -d "$sig" | grep -o 'file:[^[:space:]]*' | head -1 | cut -d: -f2-)
+            if [ "$dentro" != "$archivo" ]; then
+              echo "::error title=Firma renombrada::$archivo lleva una firma que dice «$dentro». Renombrar un artefacto firmado rompe la comprobación de nombre."
+              mal=1
+            else
+              echo "  $archivo ✓"
+            fi
+          done
+          [ "$mal" = 0 ]
+
       - name: Armar latest.json
         env:
           V: ${{ needs.mirar.outputs.version }}
@@ -389,8 +424,8 @@ jobs:
             --arg fecha "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
             --arg win_sig "$(cat "entrega/Terminus_${V}_x64-setup.exe.sig")" \
             --arg win_url "$BASE/Terminus_${V}_x64-setup.exe" \
-            --arg mac_sig "$(cat "entrega/Terminus_${V}_aarch64.app.tar.gz.sig")" \
-            --arg mac_url "$BASE/Terminus_${V}_aarch64.app.tar.gz" \
+            --arg mac_sig "$(cat "entrega/Terminus.app.tar.gz.sig")" \
+            --arg mac_url "$BASE/Terminus.app.tar.gz" \
             '{
               version: $v,
               notes: $notas,
